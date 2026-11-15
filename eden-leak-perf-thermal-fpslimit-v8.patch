@@ -1,0 +1,1887 @@
+Eden leak, performance, thermal & FPS limit patch v8
+Base: eden-emulator/mirror master 6647b49cc (2026-11-15). Apply with: git apply eden-leak-perf-thermal-fpslimit-v8.patch
+Contains v5, v6 and v7, plus the FPS limit below.
+
+FPS limit (new in v8)
+  * New setting "fps_limit" (Off / 20 / 30 / 60), per-game capable and changeable in-game from the
+    quick settings sheet and in Settings > Graphics. It stretches the emulated display composition
+    period (core/hle/service/vi/conductor.cpp), so the game gets fewer frame slots and really does
+    less CPU/GPU work; the ADPF target follows. Fixed-timestep games run in slow motion when capped
+    below their native rate. Android strings in English and Indonesian, Qt translations added.
+
+Thermal (new in v7) - aims to keep the frame rate and cut wasted power
+  * common/adpf.cpp - thermal guard. Uses AThermal_getThermalHeadroom (Android 11+, polled once a
+    second) and the real per-frame load from v6. When frames are on time with plenty of slack
+    (load EMA < 50%, or < 70% once the device is warm, headroom >= 0.80), the render ADPF session
+    is put into power-efficiency mode (Android 15+). Any late frame leaves that mode immediately.
+    Exposes IsThermallyConstrained() (headroom >= 0.95).
+  * vk_turbo_mode.cpp - "Force maximum clocks" releases the GPU turbo request while the device is
+    about to throttle and re-arms it once it has cooled down.
+  * vk_scheduler.h - frame pacing (30/60/90/120 target modes) slept until ~1 ms before the frame
+    and then spun on yield(), keeping a big core at 100% every frame. Linux/Android now use one
+    absolute CLOCK_MONOTONIC sleep (sub-100 us accuracy). Other platforms keep the old path.
+  * emu_window.cpp - the first surface frame-rate hint may switch the display mode non-seamlessly
+    (while the game boots), so 120/144 Hz panels actually drop to 60 Hz for 60 fps games. Later
+    hints stay seamless-only, so gameplay is never interrupted.
+
+v6: ADPF reports real work time, turbo only while submitting, log rate limiting, cached GPU
+probes, probe Surface release, input/netplay JNI leaks, VFS cache pruning.
+
+Build note: -PYUZU_ANDROID_ARGS="-DYUZU_DOWNLOAD_ANDROID_VVL=OFF" drops the 24 MB validation layer.
+
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/activities/EmulationActivity.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/activities/EmulationActivity.kt
+index aaabcc95b..ba72eead9 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/activities/EmulationActivity.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/activities/EmulationActivity.kt
+@@ -261,6 +261,12 @@ class EmulationActivity : AppCompatActivity(), SensorEventListener, InputManager
+ 
+     override fun onDestroy() {
+         mainHandler.removeCallbacks(romSwapStopTimeoutRunnable)
++        // The receiver is only unregistered when PiP exits normally; closing the PiP window
++        // destroys the activity while it is still registered.
++        try {
++            unregisterReceiver(pictureInPictureReceiver)
++        } catch (ignored: Exception) {
++        }
+         super.onDestroy()
+         inputManager.unregisterInputDeviceListener(this)
+         stopForegroundService(this)
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/applets/keyboard/SoftwareKeyboard.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/applets/keyboard/SoftwareKeyboard.kt
+index 26e787f37..87c8f7ffe 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/applets/keyboard/SoftwareKeyboard.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/applets/keyboard/SoftwareKeyboard.kt
+@@ -49,8 +49,13 @@ object SoftwareKeyboard {
+         handler.postDelayed(
+             object : Runnable {
+                 override fun run() {
+-                    val insets = ViewCompat.getRootWindowInsets(overlayView)
+-                    val isKeyboardVisible = insets!!.isVisible(WindowInsets.Type.ime())
++                    // A detached view has no insets; treat that as "keyboard gone" instead of crashing.
++                    val insets = if (overlayView.isAttachedToWindow) {
++                        ViewCompat.getRootWindowInsets(overlayView)
++                    } else {
++                        null
++                    }
++                    val isKeyboardVisible = insets?.isVisible(WindowInsets.Type.ime()) == true
+                     if (isKeyboardVisible) {
+                         handler.postDelayed(this, delayMs.toLong())
+                         return
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/dialogs/ChatDialog.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/dialogs/ChatDialog.kt
+index 431125ca8..01994dba8 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/dialogs/ChatDialog.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/dialogs/ChatDialog.kt
+@@ -92,6 +92,9 @@ class ChatDialog(context: Context) : BottomSheetDialog(context) {
+ 
+     override fun dismiss() {
+         NetPlayManager.setChatOpen(false)
++        // The static manager would otherwise keep this dialog and its Activity reachable.
++        NetPlayManager.setOnMessageReceivedListener(null)
++        handler.removeCallbacksAndMessages(null)
+         super.dismiss()
+     }
+ 
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/dialogs/NetPlayDialog.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/dialogs/NetPlayDialog.kt
+index 45ce5fb0c..c20ab65b7 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/dialogs/NetPlayDialog.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/dialogs/NetPlayDialog.kt
+@@ -310,6 +310,11 @@ class NetPlayDialog(context: Context) : BottomSheetDialog(context) {
+         override fun getItemCount() = netPlayItems.size
+     }
+ 
++    override fun dismiss() {
++        NetPlayManager.setOnAdapterRefreshListener(null)
++        super.dismiss()
++    }
++
+     @SuppressLint("NotifyDataSetChanged")
+     fun refreshAdapterItems() {
+         val handler = Handler(Looper.getMainLooper())
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
+index ea31692fb..b690b4d74 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
+@@ -24,6 +24,7 @@ enum class IntSetting(override val key: String) : AbstractIntSetting {
+     RENDERER_FRAME_GEN_QUEUE_TARGET("frame_gen_queue_target"),
+     RENDERER_FRAME_GEN_FLOW_SCALE("frame_gen_flow_scale"),
+     RENDERER_VSYNC("use_vsync"),
++    RENDERER_FPS_LIMIT("fps_limit"),
+     RENDERER_SCALING_FILTER("scaling_filter"),
+     RENDERER_ANTI_ALIASING("anti_aliasing"),
+     RENDERER_SCREEN_LAYOUT("screen_layout"),
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
+index 9e38be12c..8cff176ad 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
+@@ -628,6 +628,15 @@ abstract class SettingsItem(
+                     valuesId = R.array.rendererVSyncValues
+                 )
+             )
++            put(
++                SingleChoiceSetting(
++                    IntSetting.RENDERER_FPS_LIMIT,
++                    titleId = R.string.renderer_fps_limit,
++                    descriptionId = R.string.renderer_fps_limit_description,
++                    choicesId = R.array.rendererFpsLimitNames,
++                    valuesId = R.array.rendererFpsLimitValues
++                )
++            )
+             put(
+                 SingleChoiceSetting(
+                     IntSetting.RENDERER_SCALING_FILTER,
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
+index 82d66db16..dab0dfd76 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
+@@ -529,6 +529,7 @@ class SettingsFragmentPresenter(
+         sl.apply {
+             add(IntSetting.RENDERER_RESOLUTION.key)
+             add(IntSetting.RENDERER_VSYNC.key)
++            add(IntSetting.RENDERER_FPS_LIMIT.key)
+             add(IntSetting.RENDERER_SCALING_FILTER.key)
+             if (isSharpnessScalingFilterSelected()) {
+                 add(IntSetting.FSR_SHARPENING_SLIDER.key)
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/fragments/EmulationFragment.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/fragments/EmulationFragment.kt
+index a0e6e5996..ec3c05632 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/fragments/EmulationFragment.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/fragments/EmulationFragment.kt
+@@ -1291,6 +1291,14 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
+                 units = "%",
+             )
+ 
++            quickSettings.addIntSetting(
++                R.string.renderer_fps_limit,
++                container,
++                IntSetting.RENDERER_FPS_LIMIT,
++                R.array.rendererFpsLimitNames,
++                R.array.rendererFpsLimitValues
++            )
++
+             quickSettings.addBooleanSetting(
+                 R.string.use_docked_mode,
+                 container,
+@@ -1762,6 +1770,8 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
+                 }
+                 perfStatsUpdateHandler.postDelayed(perfStatsRunnable!!, 800)
+             }
++            // Drop any pending runnable first so repeated calls do not stack update chains.
++            perfStatsRunnable?.let { perfStatsUpdateHandler.removeCallbacks(it) }
+             perfStatsRunnable = Runnable { perfStatsUpdater?.invoke() }
+             perfStatsUpdateHandler.post(perfStatsRunnable!!)
+         } else {
+@@ -1913,6 +1923,7 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
+ 
+                 socUpdateHandler.postDelayed(socRunnable!!, 1000)
+             }
++            socRunnable?.let { socUpdateHandler.removeCallbacks(it) }
+             socRunnable = Runnable { socUpdater?.invoke() }
+             socUpdateHandler.post(socRunnable!!)
+         } else {
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/network/NetPlayManager.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/network/NetPlayManager.kt
+index 1e8e9f97d..1c9208511 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/network/NetPlayManager.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/network/NetPlayManager.kt
+@@ -73,7 +73,7 @@ object NetPlayManager {
+     private var messageListener: ((Int, String) -> Unit)? = null
+     private var adapterRefreshListener: ((Int, String) -> Unit)? = null
+ 
+-    fun setOnMessageReceivedListener(listener: (Int, String) -> Unit) {
++    fun setOnMessageReceivedListener(listener: ((Int, String) -> Unit)?) {
+         messageListener = listener
+     }
+ 
+@@ -122,7 +122,7 @@ object NetPlayManager {
+         }.start()
+     }
+ 
+-    fun setOnAdapterRefreshListener(listener: (Int, String) -> Unit) {
++    fun setOnAdapterRefreshListener(listener: ((Int, String) -> Unit)?) {
+         adapterRefreshListener = listener
+     }
+ 
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/utils/GpuDriverHelper.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/utils/GpuDriverHelper.kt
+index 13d5da3a5..376bc10e9 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/utils/GpuDriverHelper.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/utils/GpuDriverHelper.kt
+@@ -208,16 +208,38 @@ object GpuDriverHelper {
+ 
+     external fun supportsCustomDriverLoading(): Boolean
+ 
+-    external fun getSystemDriverInfo(
+-        surface: Surface = Surface(SurfaceTexture(true)),
+-        hookLibPath: String = GpuDriverHelper.hookLibPath!!
++    private external fun getSystemDriverInfo(
++        surface: Surface,
++        hookLibPath: String
+     ): Array<String>?
+ 
+-    external fun getGpuModel(
+-        surface: Surface = Surface(SurfaceTexture(true)),
++    private external fun getGpuModel(
++        surface: Surface,
+         hookLibPath: String
+     ): String?
+ 
++    /**
++     * The probe surfaces were created on every call and never released, so each one kept a
++     * BufferQueue (and its native buffers) alive until the finalizer happened to run.
++     */
++    private inline fun <T> withProbeSurface(block: (Surface) -> T): T {
++        val texture = SurfaceTexture(true)
++        val surface = Surface(texture)
++        try {
++            return block(surface)
++        } finally {
++            surface.release()
++            texture.release()
++        }
++    }
++
++    fun getSystemDriverInfo(
++        hookLibPath: String = GpuDriverHelper.hookLibPath!!
++    ): Array<String>? = withProbeSurface { getSystemDriverInfo(it, hookLibPath) }
++
++    fun getGpuModel(hookLibPath: String): String? =
++        withProbeSurface { getGpuModel(it, hookLibPath) }
++
+     fun isAdrenoGpu(): Boolean {
+         return try {
+             supportsCustomDriverLoading()
+diff --git a/src/android/app/src/main/jni/emu_window/emu_window.cpp b/src/android/app/src/main/jni/emu_window/emu_window.cpp
+index 8dfea4069..0d3e8563f 100644
+--- a/src/android/app/src/main/jni/emu_window/emu_window.cpp
++++ b/src/android/app/src/main/jni/emu_window/emu_window.cpp
+@@ -230,12 +230,22 @@ void EmuWindow_Android::UpdateFrameRateHint() {
+ 
+     constexpr int8_t FrameRateCompatibilityDefault = 0;
+     constexpr int8_t ChangeFrameRateOnlyIfSeamless = 0;
++    constexpr int8_t ChangeFrameRateAlways = 1;
++
++    // On many panels 120/144 Hz -> 60 Hz is not a "seamless" switch, so a seamless-only request
++    // left the display at its top refresh rate for the whole session, which costs a lot of power
++    // and heat for a 30/60 fps game. Allow one non-seamless switch for the first hint of a
++    // surface (that happens while the game is booting); later adjustments stay seamless-only so
++    // gameplay is never interrupted by a mode change.
++    const int8_t change_strategy = (m_last_frame_rate_hint < 0.0f && frame_rate_hint > 0.0f)
++                                       ? ChangeFrameRateAlways
++                                       : ChangeFrameRateOnlyIfSeamless;
+ 
+     int32_t result = -1;
+     if (set_frame_rate_with_change_strategy) {
+         result = set_frame_rate_with_change_strategy(surface, frame_rate_hint,
+                                                      FrameRateCompatibilityDefault,
+-                                                     ChangeFrameRateOnlyIfSeamless);
++                                                     change_strategy);
+     } else if (set_frame_rate) {
+         result = set_frame_rate(surface, frame_rate_hint, FrameRateCompatibilityDefault);
+     } else {
+diff --git a/src/android/app/src/main/jni/native.cpp b/src/android/app/src/main/jni/native.cpp
+index 89b905a12..282f48be3 100644
+--- a/src/android/app/src/main/jni/native.cpp
++++ b/src/android/app/src/main/jni/native.cpp
+@@ -13,12 +13,15 @@
+ #include <format>
+ #include <locale>
+ #include <map>
++#include <mutex>
++#include <optional>
+ #include <set>
+ #include <sstream>
+ #include <span>
+ #include <string>
+ #include <string_view>
+ #include <thread>
++#include <utility>
+ #include <vector>
+ #include <dlfcn.h>
+ #include <unistd.h>
+@@ -366,6 +369,8 @@ void EmulationSession::ShutdownEmulation() {
+     }
+ 
+     m_is_running = false;
++    // The applet that owns this pointer is destroyed with the system.
++    m_software_keyboard = nullptr;
+ 
+     // Unload user input.
+     m_system.HIDCore().UnloadInputDevices();
+@@ -741,6 +746,22 @@ const char* fallback_cpu_detection() {
+     return s_result.c_str();
+ }
+ 
++// This runs once per progress tick inside a single long native call, so every local reference
++// created here has to be released or the local reference table eventually overflows.
++bool InvokeProgressCallback(JNIEnv* env, jobject callback, jmethodID invoke, size_t max,
++                            size_t progress) {
++    jobject j_max = Common::Android::ToJDouble(env, static_cast<double>(max));
++    jobject j_progress = Common::Android::ToJDouble(env, static_cast<double>(progress));
++    jobject j_result = env->CallObjectMethod(callback, invoke, j_max, j_progress);
++    const bool cancelled = j_result != nullptr && Common::Android::GetJBoolean(env, j_result);
++    env->DeleteLocalRef(j_max);
++    env->DeleteLocalRef(j_progress);
++    if (j_result != nullptr) {
++        env->DeleteLocalRef(j_result);
++    }
++    return cancelled;
++}
++
+ } // namespace
+ 
+ extern "C" {
+@@ -754,8 +775,13 @@ extern "C" {
+ 
+ void Java_org_yuzu_yuzu_1emu_NativeLibrary_surfaceChanged(JNIEnv* env, jobject instance,
+                                                           [[maybe_unused]] jobject surf) {
++    auto* const previous_window = EmulationSession::GetInstance().NativeWindow();
+     EmulationSession::GetInstance().SetNativeWindow(ANativeWindow_fromSurface(env, surf));
+     EmulationSession::GetInstance().SurfaceChanged();
++    // Drop the reference taken for the previous surface, otherwise it leaks on every resize.
++    if (previous_window) {
++        ANativeWindow_release(previous_window);
++    }
+ }
+ 
+ void Java_org_yuzu_yuzu_1emu_NativeLibrary_surfaceDestroyed(JNIEnv* env, jobject instance) {
+@@ -775,11 +801,9 @@ int Java_org_yuzu_yuzu_1emu_NativeLibrary_installFileToNand(JNIEnv* env, jobject
+     auto jlambdaClass = env->GetObjectClass(jcallback);
+     auto jlambdaInvokeMethod = env->GetMethodID(
+         jlambdaClass, "invoke", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
++    env->DeleteLocalRef(jlambdaClass);
+     const auto callback = [env, jcallback, jlambdaInvokeMethod](size_t max, size_t progress) {
+-        auto jwasCancelled = env->CallObjectMethod(jcallback, jlambdaInvokeMethod,
+-                                                   Common::Android::ToJDouble(env, max),
+-                                                   Common::Android::ToJDouble(env, progress));
+-        return Common::Android::GetJBoolean(env, jwasCancelled);
++        return InvokeProgressCallback(env, jcallback, jlambdaInvokeMethod, max, progress);
+     };
+ 
+     return static_cast<int>(
+@@ -861,15 +885,21 @@ jboolean JNICALL Java_org_yuzu_yuzu_1emu_utils_GpuDriverHelper_supportsCustomDri
+ jobjectArray Java_org_yuzu_yuzu_1emu_utils_GpuDriverHelper_getSystemDriverInfo(
+     JNIEnv* env, jobject j_obj, jobject j_surf, jstring j_hook_lib_dir) {
+ #ifdef ARCHITECTURE_arm64
++    // The system driver cannot change while the process is alive, but probing it loads the driver
++    // into a fresh linker namespace and creates a whole Vulkan instance and device. Do it once.
++    static std::mutex s_driver_info_mutex;
++    static std::optional<std::pair<std::string, std::string>> s_driver_info;
++    std::scoped_lock driver_info_lock{s_driver_info_mutex};
++    if (!s_driver_info) {
+     const char* file_redirect_dir_{};
+     int featureFlags{};
+     std::string hook_lib_dir = Common::Android::GetJString(env, j_hook_lib_dir);
+     auto handle = adrenotools_open_libvulkan(RTLD_NOW, featureFlags, nullptr, hook_lib_dir.c_str(),
+                                              nullptr, nullptr, file_redirect_dir_, nullptr);
+     auto driver_library = std::make_shared<Common::DynamicLibrary>(handle);
+-    InputCommon::InputSubsystem input_subsystem;
+-    auto window =
+-        std::make_unique<EmuWindow_Android>(ANativeWindow_fromSurface(env, j_surf), driver_library);
++    const std::unique_ptr<ANativeWindow, decltype(&ANativeWindow_release)> native_window{
++        ANativeWindow_fromSurface(env, j_surf), &ANativeWindow_release};
++    auto window = std::make_unique<EmuWindow_Android>(native_window.get(), driver_library);
+ 
+     Vulkan::vk::InstanceDispatch dld;
+     Vulkan::vk::Instance vk_instance = Vulkan::CreateInstance(
+@@ -880,31 +910,47 @@ jobjectArray Java_org_yuzu_yuzu_1emu_utils_GpuDriverHelper_getSystemDriverInfo(
+     auto device = Vulkan::CreateDevice(vk_instance, dld, *surface);
+ 
+     auto driver_version = device.GetDriverVersion();
+-    auto version_string =
++    s_driver_info.emplace(
+         std::format("{}.{}.{}", VK_API_VERSION_MAJOR(driver_version),
+-                    VK_API_VERSION_MINOR(driver_version), VK_API_VERSION_PATCH(driver_version));
+-    auto driver_name = device.GetDriverName();
++                    VK_API_VERSION_MINOR(driver_version), VK_API_VERSION_PATCH(driver_version)),
++        device.GetDriverName());
++    }
++    const std::string& version_string = s_driver_info->first;
++    const std::string& driver_name = s_driver_info->second;
+ #else
+     auto driver_version = "1.0.0";
+     auto version_string = "1.1.0"; //Assume lowest Vulkan level
+     auto driver_name = "generic";
+ #endif
+-    jobjectArray j_driver_info = env->NewObjectArray(2, Common::Android::GetStringClass(), Common::Android::ToJString(env, version_string));
+-    env->SetObjectArrayElement(j_driver_info, 1, Common::Android::ToJString(env, driver_name));
++    jstring j_version = Common::Android::ToJString(env, version_string);
++    jobjectArray j_driver_info =
++        env->NewObjectArray(2, Common::Android::GetStringClass(), j_version);
++    env->DeleteLocalRef(j_version);
++    jstring j_driver_name = Common::Android::ToJString(env, driver_name);
++    env->SetObjectArrayElement(j_driver_info, 1, j_driver_name);
++    env->DeleteLocalRef(j_driver_name);
+     return j_driver_info;
+ }
+ 
+ jstring Java_org_yuzu_yuzu_1emu_utils_GpuDriverHelper_getGpuModel(JNIEnv *env, jobject j_obj, jobject j_surf, jstring j_hook_lib_dir) {
+ #ifdef ARCHITECTURE_arm64
++    // Called on every emulation start; the GPU model is a property of the hardware, so probe the
++    // driver (new linker namespace + Vulkan instance + device) only the first time.
++    static std::mutex s_gpu_model_mutex;
++    static std::optional<std::string> s_gpu_model;
++    std::scoped_lock gpu_model_lock{s_gpu_model_mutex};
++    if (s_gpu_model) {
++        return Common::Android::ToJString(env, *s_gpu_model);
++    }
+     const char* file_redirect_dir_{};
+     int featureFlags{};
+     std::string hook_lib_dir = Common::Android::GetJString(env, j_hook_lib_dir);
+     auto handle = adrenotools_open_libvulkan(RTLD_NOW, featureFlags, nullptr, hook_lib_dir.c_str(),
+                                              nullptr, nullptr, file_redirect_dir_, nullptr);
+     auto driver_library = std::make_shared<Common::DynamicLibrary>(handle);
+-    InputCommon::InputSubsystem input_subsystem;
+-    auto window =
+-            std::make_unique<EmuWindow_Android>(ANativeWindow_fromSurface(env, j_surf), driver_library);
++    const std::unique_ptr<ANativeWindow, decltype(&ANativeWindow_release)> native_window{
++        ANativeWindow_fromSurface(env, j_surf), &ANativeWindow_release};
++    auto window = std::make_unique<EmuWindow_Android>(native_window.get(), driver_library);
+ 
+     Vulkan::vk::InstanceDispatch dld;
+     Vulkan::vk::Instance vk_instance = Vulkan::CreateInstance(
+@@ -914,11 +960,9 @@ jstring Java_org_yuzu_yuzu_1emu_utils_GpuDriverHelper_getGpuModel(JNIEnv *env, j
+ 
+     auto device = Vulkan::CreateDevice(vk_instance, dld, *surface);
+ 
+-    const std::string model_name{device.GetModelName()};
+-
+-    window.release();
++    s_gpu_model.emplace(device.GetModelName());
+ 
+-    return Common::Android::ToJString(env, model_name);
++    return Common::Android::ToJString(env, *s_gpu_model);
+ #else
+     return Common::Android::ToJString(env, "no-info");
+ #endif
+@@ -1393,12 +1437,16 @@ void Java_org_yuzu_yuzu_1emu_NativeLibrary_logDeviceInfo(JNIEnv* env, jclass cla
+ void Java_org_yuzu_yuzu_1emu_NativeLibrary_submitInlineKeyboardText(JNIEnv* env, jclass clazz,
+                                                                     jstring j_text) {
+     const std::u16string input = Common::UTF8ToUTF16(Common::Android::GetJString(env, j_text));
+-    EmulationSession::GetInstance().SoftwareKeyboard()->SubmitInlineKeyboardText(input);
++    if (auto* keyboard = EmulationSession::GetInstance().SoftwareKeyboard()) {
++        keyboard->SubmitInlineKeyboardText(input);
++    }
+ }
+ 
+ void Java_org_yuzu_yuzu_1emu_NativeLibrary_submitInlineKeyboardInput(JNIEnv* env, jclass clazz,
+                                                                      jint j_key_code) {
+-    EmulationSession::GetInstance().SoftwareKeyboard()->SubmitInlineKeyboardInput(j_key_code);
++    if (auto* keyboard = EmulationSession::GetInstance().SoftwareKeyboard()) {
++        keyboard->SubmitInlineKeyboardInput(j_key_code);
++    }
+ }
+ 
+ void Java_org_yuzu_yuzu_1emu_NativeLibrary_initializeEmptyUserDirectory(JNIEnv* env,
+@@ -1633,20 +1681,22 @@ jobjectArray Java_org_yuzu_yuzu_1emu_NativeLibrary_verifyInstalledContents(JNIEn
+     auto jlambdaClass = env->GetObjectClass(jcallback);
+     auto jlambdaInvokeMethod = env->GetMethodID(
+         jlambdaClass, "invoke", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
++    env->DeleteLocalRef(jlambdaClass);
+     const auto callback = [env, jcallback, jlambdaInvokeMethod](size_t max, size_t progress) {
+-        auto jwasCancelled = env->CallObjectMethod(jcallback, jlambdaInvokeMethod,
+-                                                   Common::Android::ToJDouble(env, max),
+-                                                   Common::Android::ToJDouble(env, progress));
+-        return Common::Android::GetJBoolean(env, jwasCancelled);
++        return InvokeProgressCallback(env, jcallback, jlambdaInvokeMethod, max, progress);
+     };
+ 
+     auto& session = EmulationSession::GetInstance();
+     std::vector<std::string> result = ContentManager::VerifyInstalledContents(
+         session.System(), *session.GetContentProvider(), callback);
+-    jobjectArray jresult = env->NewObjectArray(result.size(), Common::Android::GetStringClass(),
+-                                               Common::Android::ToJString(env, ""));
++    jstring j_empty = Common::Android::ToJString(env, "");
++    jobjectArray jresult =
++        env->NewObjectArray(result.size(), Common::Android::GetStringClass(), j_empty);
++    env->DeleteLocalRef(j_empty);
+     for (size_t i = 0; i < result.size(); ++i) {
+-        env->SetObjectArrayElement(jresult, i, Common::Android::ToJString(env, result[i]));
++        jstring j_item = Common::Android::ToJString(env, result[i]);
++        env->SetObjectArrayElement(jresult, i, j_item);
++        env->DeleteLocalRef(j_item);
+     }
+     return jresult;
+ }
+@@ -1656,11 +1706,9 @@ jint Java_org_yuzu_yuzu_1emu_NativeLibrary_verifyGameContents(JNIEnv* env, jobje
+     auto jlambdaClass = env->GetObjectClass(jcallback);
+     auto jlambdaInvokeMethod = env->GetMethodID(
+         jlambdaClass, "invoke", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
++    env->DeleteLocalRef(jlambdaClass);
+     const auto callback = [env, jcallback, jlambdaInvokeMethod](size_t max, size_t progress) {
+-        auto jwasCancelled = env->CallObjectMethod(jcallback, jlambdaInvokeMethod,
+-                                                   Common::Android::ToJDouble(env, max),
+-                                                   Common::Android::ToJDouble(env, progress));
+-        return Common::Android::GetJBoolean(env, jwasCancelled);
++        return InvokeProgressCallback(env, jcallback, jlambdaInvokeMethod, max, progress);
+     };
+     auto& session = EmulationSession::GetInstance();
+     return static_cast<jint>(ContentManager::VerifyGameContents(
+diff --git a/src/android/app/src/main/jni/native_input.cpp b/src/android/app/src/main/jni/native_input.cpp
+index a8b4af099..1ce6ae532 100644
+--- a/src/android/app/src/main/jni/native_input.cpp
++++ b/src/android/app/src/main/jni/native_input.cpp
+@@ -218,9 +218,10 @@ void Java_org_yuzu_yuzu_1emu_features_input_NativeInput_onGamePadMotionEvent(
+ 
+ void Java_org_yuzu_yuzu_1emu_features_input_NativeInput_onReadNfcTag(JNIEnv* env, jobject j_obj,
+                                                                      jbyteArray j_data) {
+-    jboolean isCopy{false};
+-    std::span<u8> data(reinterpret_cast<u8*>(env->GetByteArrayElements(j_data, &isCopy)),
+-                       static_cast<size_t>(env->GetArrayLength(j_data)));
++    // Copy out of the Java array so no pinned/copied buffer is left unreleased.
++    std::vector<u8> data(static_cast<size_t>(env->GetArrayLength(j_data)));
++    env->GetByteArrayRegion(j_data, 0, static_cast<jsize>(data.size()),
++                            reinterpret_cast<jbyte*>(data.data()));
+ 
+     if (EmulationSession::GetInstance().IsRunning()) {
+         EmulationSession::GetInstance().GetInputSubsystem().GetVirtualAmiibo()->LoadAmiibo(data);
+@@ -630,6 +631,7 @@ void Java_org_yuzu_yuzu_1emu_features_input_NativeInput_connectControllersImpl(
+     for (int i = 0; i < j_connected_array_size; ++i) {
+         ConnectController(i, j_connected_array[i]);
+     }
++    env->ReleaseBooleanArrayElements(j_connected, j_connected_array, JNI_ABORT);
+ }
+ 
+ void Java_org_yuzu_yuzu_1emu_features_input_NativeInput_resetControllerMappings(
+diff --git a/src/android/app/src/main/res/values-id/strings.xml b/src/android/app/src/main/res/values-id/strings.xml
+index 6dcb32357..116b53eab 100644
+--- a/src/android/app/src/main/res/values-id/strings.xml
++++ b/src/android/app/src/main/res/values-id/strings.xml
+@@ -377,6 +377,9 @@
+     <!-- Graphics settings strings -->
+     <string name="renderer_resolution">Resolusi (Handheld/Docked)</string>
+     <string name="renderer_vsync">Mode Sinkronisasi Vertikal</string>
++    <string name="renderer_fps_limit">Batas FPS</string>
++    <string name="renderer_fps_limit_description">Membatasi seberapa sering game boleh merender frame. Batas yang lebih rendah mengurangi beban CPU dan GPU sehingga perangkat lebih dingin. Game yang kecepatannya terikat ke jumlah frame akan berjalan lambat (slow motion) bila dibatasi di bawah FPS aslinya.</string>
++    <string name="renderer_fps_limit_off">Mati</string>
+     <string name="renderer_scaling_filter">Filter penyesuaian jendela</string>
+     <string name="renderer_anti_aliasing">Metode anti-aliasing</string>
+ 
+diff --git a/src/android/app/src/main/res/values/arrays.xml b/src/android/app/src/main/res/values/arrays.xml
+index be367a2fc..2dee42f64 100644
+--- a/src/android/app/src/main/res/values/arrays.xml
++++ b/src/android/app/src/main/res/values/arrays.xml
+@@ -220,6 +220,20 @@
+         <item>8</item>
+     </integer-array>
+ 
++    <string-array name="rendererFpsLimitNames">
++        <item>@string/renderer_fps_limit_off</item>
++        <item>@string/renderer_fps_limit_20</item>
++        <item>@string/renderer_fps_limit_30</item>
++        <item>@string/renderer_fps_limit_60</item>
++    </string-array>
++
++    <integer-array name="rendererFpsLimitValues">
++        <item>0</item>
++        <item>1</item>
++        <item>2</item>
++        <item>3</item>
++    </integer-array>
++
+     <integer-array name="rendererVSyncValues">
+         <item>0</item>
+         <item>1</item>
+diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
+index 16ae1a358..1b22d0477 100644
+--- a/src/android/app/src/main/res/values/strings.xml
++++ b/src/android/app/src/main/res/values/strings.xml
+@@ -551,6 +551,12 @@
+     <!-- Graphics settings strings -->
+     <string name="renderer_resolution">Resolution (Handheld/Docked)</string>
+     <string name="renderer_vsync">VSync mode</string>
++    <string name="renderer_fps_limit">FPS limit</string>
++    <string name="renderer_fps_limit_description">Caps how often the game may render a frame. Lower limits reduce CPU and GPU load and keep the device cooler. Games that run on a fixed per-frame timestep play in slow motion below their native frame rate.</string>
++    <string name="renderer_fps_limit_off">Off</string>
++    <string name="renderer_fps_limit_20">20 FPS</string>
++    <string name="renderer_fps_limit_30">30 FPS</string>
++    <string name="renderer_fps_limit_60">60 FPS</string>
+     <string name="renderer_scaling_filter">Window adapting filter</string>
+     <string name="fsr_sharpness">FSR/SGSR sharpness</string>
+     <string name="fsr_sharpness_description">Determines how sharpened the image will look while using FSR or SGSR filters</string>
+diff --git a/src/common/adpf.cpp b/src/common/adpf.cpp
+index 8fa299617..413e4aecf 100644
+--- a/src/common/adpf.cpp
++++ b/src/common/adpf.cpp
+@@ -12,7 +12,13 @@
+ #include <mutex>
+ #include <vector>
+ 
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <unordered_map>
++
+ #include <dlfcn.h>
++#include <fcntl.h>
+ #include <unistd.h>
+ 
+ #include "common/logging.h"
+@@ -92,6 +98,81 @@ const Api& Resolve() {
+     return api;
+ }
+ 
++// --- Thermal guard -------------------------------------------------------------------------------
++//
++// Asking for power efficiency only while there is plenty of slack keeps the frame rate where it
++// is but stops the HAL from boosting into the inefficient top of the frequency table. As the
++// device approaches its throttling point (thermal headroom close to 1.0) the amount of slack that
++// is required to enter that mode drops, so the phone sheds heat before the kernel has to cut
++// clocks hard (which is what causes the large, sudden FPS drops after a few minutes of play).
++
++struct AThermalManager;
++using PFN_AcquireThermal = AThermalManager* (*)();
++using PFN_GetHeadroom = float (*)(AThermalManager*, int);
++
++struct ThermalApi {
++    AThermalManager* manager = nullptr;
++    PFN_GetHeadroom get_headroom = nullptr;
++};
++
++const ThermalApi& ResolveThermal() {
++    static const ThermalApi api = [] {
++        ThermalApi resolved;
++        void* library = dlopen("libandroid.so", RTLD_NOW);
++        if (library == nullptr) {
++            return resolved;
++        }
++        const auto acquire =
++            reinterpret_cast<PFN_AcquireThermal>(dlsym(library, "AThermal_acquireManager"));
++        resolved.get_headroom =
++            reinterpret_cast<PFN_GetHeadroom>(dlsym(library, "AThermal_getThermalHeadroom"));
++        if (acquire == nullptr || resolved.get_headroom == nullptr) {
++            resolved.get_headroom = nullptr;
++            return resolved;
++        }
++        resolved.manager = acquire();
++        if (resolved.manager == nullptr) {
++            resolved.get_headroom = nullptr;
++        }
++        LOG_INFO(Common, "Thermal headroom API {}", resolved.get_headroom ? "available" : "unavailable");
++        return resolved;
++    }();
++    return api;
++}
++
++constexpr auto HEADROOM_QUERY_INTERVAL = std::chrono::seconds{1}; // API is rate limited
++constexpr int HEADROOM_FORECAST_SECONDS = 3;
++constexpr float HEADROOM_WARM = 0.80f;        // getting warm: be stricter about wasted clocks
++constexpr float HEADROOM_CONSTRAINED = 0.95f; // throttling is imminent
++constexpr double LOAD_ENTER_COOL = 0.50;      // busy/target ratio needed to save power when cool
++constexpr double LOAD_ENTER_WARM = 0.70;      // ... and when warm
++constexpr double LOAD_HYSTERESIS = 0.15;
++
++struct ThermalState {
++    float headroom = 0.0f;
++    std::chrono::steady_clock::time_point last_query{};
++    double load_ema = 1.0;
++    bool efficiency_wanted = false;
++    AHintSession* efficiency_applied_to = nullptr;
++    bool efficiency_applied = false;
++};
++ThermalState g_thermal; // guarded by g_mutex
++std::atomic<bool> g_thermally_constrained{false};
++
++void UpdateHeadroomLocked(std::chrono::steady_clock::time_point now) {
++    const ThermalApi& thermal = ResolveThermal();
++    if (thermal.get_headroom == nullptr || now - g_thermal.last_query < HEADROOM_QUERY_INTERVAL) {
++        return;
++    }
++    g_thermal.last_query = now;
++    const float headroom = thermal.get_headroom(thermal.manager, HEADROOM_FORECAST_SECONDS);
++    if (!std::isfinite(headroom)) {
++        return; // NaN when queried too often or not supported by the HAL
++    }
++    g_thermal.headroom = headroom;
++    g_thermally_constrained.store(headroom >= HEADROOM_CONSTRAINED, std::memory_order_relaxed);
++}
++
+ struct SessionState {
+     AHintSession* handle = nullptr;
+     std::vector<pid_t> threads;
+@@ -106,6 +187,94 @@ constexpr s64 MAX_REPORTED_TARGETS = 4;
+ std::atomic<s64> g_target_ns{DEFAULT_TARGET.count()};
+ thread_local std::chrono::steady_clock::time_point t_last_frame{};
+ 
++// Per-thread CPU time samples of the render session, read from
++// /proc/self/task/<tid>/schedstat (first field = nanoseconds spent running).
++//
++// ADPF expects the *work* duration of a frame. Reporting the wall-clock frame interval instead
++// means every frame that is paced by the speed limiter or vsync looks like it used 100% of its
++// budget, so the power HAL never has headroom to lower clocks and the device runs hot even when
++// the game is idling at its target frame rate.
++struct ThreadSample {
++    int fd = -1;
++    s64 last_runtime_ns = -1;
++};
++std::unordered_map<pid_t, ThreadSample> g_samples; // guarded by g_mutex
++
++s64 ReadThreadRuntimeNs(pid_t tid, ThreadSample& sample) {
++    if (sample.fd < 0) {
++        char path[64];
++        std::snprintf(path, sizeof(path), "/proc/self/task/%d/schedstat", static_cast<int>(tid));
++        sample.fd = open(path, O_RDONLY | O_CLOEXEC);
++        if (sample.fd < 0) {
++            return -1;
++        }
++    }
++    char buffer[96];
++    const ssize_t length = pread(sample.fd, buffer, sizeof(buffer) - 1, 0);
++    if (length <= 0) {
++        close(sample.fd);
++        sample.fd = -1;
++        return -1;
++    }
++    buffer[length] = '\0';
++    char* end = nullptr;
++    const long long runtime = std::strtoll(buffer, &end, 10);
++    if (end == buffer || runtime < 0) {
++        return -1;
++    }
++    return static_cast<s64>(runtime);
++}
++
++void DropSampleLocked(pid_t tid) {
++    if (const auto it = g_samples.find(tid); it != g_samples.end()) {
++        if (it->second.fd >= 0) {
++            close(it->second.fd);
++        }
++        g_samples.erase(it);
++    }
++}
++
++void DropAllSamplesLocked() {
++    for (auto& [tid, sample] : g_samples) {
++        if (sample.fd >= 0) {
++            close(sample.fd);
++        }
++    }
++    g_samples.clear();
++}
++
++/// Returns the largest CPU time any render-session thread consumed since the previous call,
++/// or -1 when no thread could be sampled. Must be called with g_mutex held.
++s64 SampleBusiestThreadLocked(const std::vector<pid_t>& threads) {
++    s64 busiest = -1;
++    for (const pid_t tid : threads) {
++        ThreadSample& sample = g_samples[tid];
++        const s64 runtime = ReadThreadRuntimeNs(tid, sample);
++        if (runtime < 0) {
++            continue;
++        }
++        const s64 previous = sample.last_runtime_ns;
++        sample.last_runtime_ns = runtime;
++        if (previous >= 0 && runtime >= previous) {
++            busiest = (std::max)(busiest, runtime - previous);
++        }
++    }
++    // Threads that moved to another session or exited without unregistering keep an entry (and an
++    // open fd); prune them once the map clearly outgrows the session.
++    if (g_samples.size() > threads.size() * 2 + 8) {
++        std::erase_if(g_samples, [&threads](auto& entry) {
++            if (std::find(threads.begin(), threads.end(), entry.first) != threads.end()) {
++                return false;
++            }
++            if (entry.second.fd >= 0) {
++                close(entry.second.fd);
++            }
++            return true;
++        });
++    }
++    return busiest;
++}
++
+ SessionState& StateOf(Session session) {
+     return g_sessions[static_cast<size_t>(session)];
+ }
+@@ -227,6 +396,7 @@ void RemoveCurrentThread() {
+     }
+     const pid_t tid = gettid();
+     std::scoped_lock lock{g_mutex};
++    DropSampleLocked(tid);
+     for (size_t i = 0; i < g_sessions.size(); ++i) {
+         SessionState& state = g_sessions[i];
+         if (std::erase(state.threads, tid) != 0) {
+@@ -263,19 +433,70 @@ void ReportFrameInterval() {
+         return;
+     }
+ 
+-    s64 actual = std::chrono::duration_cast<std::chrono::nanoseconds>(now - previous).count();
+-    if (actual <= 0) {
++    const s64 interval =
++        std::chrono::duration_cast<std::chrono::nanoseconds>(now - previous).count();
++    if (interval <= 0) {
+         return;
+     }
+ 
+-    const s64 ceiling = g_target_ns.load(std::memory_order_relaxed) * MAX_REPORTED_TARGETS;
+-    actual = (std::min)(actual, ceiling);
++    const s64 target = g_target_ns.load(std::memory_order_relaxed);
++    const s64 ceiling = target * MAX_REPORTED_TARGETS;
+ 
+     std::scoped_lock lock{g_mutex};
+     SessionState& state = StateOf(Session::Render);
+-    if (state.handle != nullptr) {
+-        api.report_actual(state.handle, actual);
++    if (state.handle == nullptr) {
++        return;
++    }
++
++    s64 actual = interval;
++    // A frame that arrived on time (within 10% of the target) was limited by pacing, not by work:
++    // report how long the busiest render thread actually ran so the HAL can drop clocks. A late
++    // frame keeps reporting the wall-clock interval, which asks for more performance.
++    if (interval <= target + target / 10) {
++        const s64 busiest = SampleBusiestThreadLocked(state.threads);
++        if (busiest > 0) {
++            actual = (std::min)(busiest, interval);
++        }
++    } else {
++        // Keep the per-thread baselines current so the next on-time frame measures one frame.
++        static_cast<void>(SampleBusiestThreadLocked(state.threads));
++    }
++    actual = std::clamp<s64>(actual, 1, ceiling);
++    api.report_actual(state.handle, actual);
++
++    // Thermal guard: track how much of the frame budget is really used and decide whether the
++    // session can run in power-efficiency mode without missing frames.
++    const bool late = interval > target + target / 10;
++    const double load = late ? static_cast<double>(interval) / static_cast<double>(target)
++                             : static_cast<double>(actual) / static_cast<double>(target);
++    g_thermal.load_ema += (load - g_thermal.load_ema) * 0.1;
++    UpdateHeadroomLocked(now);
++
++    if (api.set_power_efficiency == nullptr) {
++        return;
+     }
++    const double enter =
++        g_thermal.headroom >= HEADROOM_WARM ? LOAD_ENTER_WARM : LOAD_ENTER_COOL;
++    if (late) {
++        // Any missed deadline leaves efficiency mode immediately; performance comes first.
++        g_thermal.efficiency_wanted = false;
++        g_thermal.load_ema = (std::max)(g_thermal.load_ema, enter + LOAD_HYSTERESIS);
++    } else if (g_thermal.efficiency_wanted) {
++        g_thermal.efficiency_wanted = g_thermal.load_ema < enter + LOAD_HYSTERESIS;
++    } else {
++        g_thermal.efficiency_wanted = g_thermal.load_ema < enter;
++    }
++    // Sessions can be recreated when threads join or leave, which resets the flag.
++    if (g_thermal.efficiency_applied_to != state.handle ||
++        g_thermal.efficiency_applied != g_thermal.efficiency_wanted) {
++        api.set_power_efficiency(state.handle, g_thermal.efficiency_wanted);
++        g_thermal.efficiency_applied_to = state.handle;
++        g_thermal.efficiency_applied = g_thermal.efficiency_wanted;
++    }
++}
++
++bool IsThermallyConstrained() {
++    return g_thermally_constrained.load(std::memory_order_relaxed);
+ }
+ 
+ void Shutdown() {
+@@ -288,6 +509,9 @@ void Shutdown() {
+         state.threads.clear();
+         state.unsupported = false;
+     }
++    DropAllSamplesLocked();
++    g_thermal = ThermalState{};
++    g_thermally_constrained.store(false, std::memory_order_relaxed);
+ }
+ 
+ } // namespace Common::ADPF
+@@ -310,6 +534,10 @@ void SetTargetWorkDuration(std::chrono::nanoseconds) {}
+ 
+ void ReportFrameInterval() {}
+ 
++bool IsThermallyConstrained() {
++    return false;
++}
++
+ void Shutdown() {}
+ 
+ } // namespace Common::ADPF
+diff --git a/src/common/adpf.h b/src/common/adpf.h
+index 6f14a0bee..e4de9e7cc 100644
+--- a/src/common/adpf.h
++++ b/src/common/adpf.h
+@@ -21,6 +21,9 @@ void SetTargetWorkDuration(std::chrono::nanoseconds target);
+ 
+ void ReportFrameInterval();
+ 
++/// True while the device reports it is about to thermally throttle (Android thermal headroom).
++bool IsThermallyConstrained();
++
+ void Shutdown();
+ 
+ } // namespace Common::ADPF
+diff --git a/src/common/android/multiplayer/multiplayer.cpp b/src/common/android/multiplayer/multiplayer.cpp
+index c8c06268c..e3e65042f 100644
+--- a/src/common/android/multiplayer/multiplayer.cpp
++++ b/src/common/android/multiplayer/multiplayer.cpp
+@@ -33,7 +33,11 @@ void AndroidMultiplayer::AddNetPlayMessage(jint type, jstring msg) {
+ 
+ void AndroidMultiplayer::AddNetPlayMessage(int type, const std::string &msg) {
+     JNIEnv *env = IDCache::GetEnvForThread();
+-    AddNetPlayMessage(type, Common::Android::ToJString(env, msg));
++    // Called from long-lived network threads that never return to Java, so local references are
++    // never popped automatically.
++    jstring j_msg = Common::Android::ToJString(env, msg);
++    AddNetPlayMessage(type, j_msg);
++    env->DeleteLocalRef(j_msg);
+ }
+ 
+ void AndroidMultiplayer::ClearChat() {
+diff --git a/src/common/fs/file.cpp b/src/common/fs/file.cpp
+index 9e9016e5e..4e58b20ad 100644
+--- a/src/common/fs/file.cpp
++++ b/src/common/fs/file.cpp
+@@ -383,8 +383,10 @@ void IOFile::Open(const fs::path& path, FileAccessMode mode, FileType type, File
+             int const fd = Android::OpenContentUri(path, Android::OpenMode::Read);
+             if (fd != -1) {
+                 file = fdopen(fd, "r");
+-                if (errno != 0 && file == nullptr)
++                if (file == nullptr) {
+                     LOG_ERROR(Common_Filesystem, "Error opening file: {}, error: {}", path.c_str(), strerror(errno));
++                    close(fd);
++                }
+             } else {
+                 LOG_ERROR(Common_Filesystem, "Error opening file: {}", path.c_str());
+             }
+diff --git a/src/common/fs/fs_android.cpp b/src/common/fs/fs_android.cpp
+index b96656da3..b4123492a 100644
+--- a/src/common/fs/fs_android.cpp
++++ b/src/common/fs/fs_android.cpp
+@@ -12,6 +12,23 @@
+ 
+ namespace Common::FS::Android {
+ 
++namespace {
++
++// Native threads attached to the JVM never pop their local references, so every one created here
++// has to be deleted explicitly or the local reference table eventually overflows.
++struct LocalRef {
++    JNIEnv* env;
++    jobject ref;
++
++    ~LocalRef() {
++        if (ref != nullptr) {
++            env->DeleteLocalRef(ref);
++        }
++    }
++};
++
++} // namespace
++
+ void RegisterCallbacks(JNIEnv* env, jclass clazz) {
+     env->GetJavaVM(&g_jvm);
+     native_library = clazz;
+@@ -61,9 +78,11 @@ s32 OpenContentUri(const std::string& filepath, OpenMode openmode) {
+         return -1;
+     }
+     auto env = Common::Android::GetEnvForThread();
+-    jstring j_filepath = Common::Android::ToJString(env, filepath);
+-    jstring j_mode = Common::Android::ToJString(env, mode);
+-    return env->CallStaticIntMethod(native_library, s_open_content_uri, j_filepath, j_mode);
++    LocalRef j_filepath{env, Common::Android::ToJString(env, filepath)};
++    LocalRef j_mode{env, Common::Android::ToJString(env, mode)};
++    return env->CallStaticIntMethod(native_library, s_open_content_uri,
++                                    static_cast<jstring>(j_filepath.ref),
++                                    static_cast<jstring>(j_mode.ref));
+ }
+ 
+ u64 GetSize(const std::string& filepath) {
+@@ -71,9 +90,9 @@ u64 GetSize(const std::string& filepath) {
+         return 0;
+     }
+     auto env = Common::Android::GetEnvForThread();
+-    return static_cast<u64>(env->CallStaticLongMethod(
+-        native_library, s_get_size,
+-        Common::Android::ToJString(Common::Android::GetEnvForThread(), filepath)));
++    LocalRef j_filepath{env, Common::Android::ToJString(env, filepath)};
++    return static_cast<u64>(env->CallStaticLongMethod(native_library, s_get_size,
++                                                      static_cast<jstring>(j_filepath.ref)));
+ }
+ 
+ bool IsDirectory(const std::string& filepath) {
+@@ -81,9 +100,9 @@ bool IsDirectory(const std::string& filepath) {
+         return 0;
+     }
+     auto env = Common::Android::GetEnvForThread();
+-    return env->CallStaticBooleanMethod(
+-        native_library, s_is_directory,
+-        Common::Android::ToJString(Common::Android::GetEnvForThread(), filepath));
++    LocalRef j_filepath{env, Common::Android::ToJString(env, filepath)};
++    return env->CallStaticBooleanMethod(native_library, s_is_directory,
++                                        static_cast<jstring>(j_filepath.ref));
+ }
+ 
+ bool Exists(const std::string& filepath) {
+@@ -91,9 +110,9 @@ bool Exists(const std::string& filepath) {
+         return 0;
+     }
+     auto env = Common::Android::GetEnvForThread();
+-    return env->CallStaticBooleanMethod(
+-        native_library, s_file_exists,
+-        Common::Android::ToJString(Common::Android::GetEnvForThread(), filepath));
++    LocalRef j_filepath{env, Common::Android::ToJString(env, filepath)};
++    return env->CallStaticBooleanMethod(native_library, s_file_exists,
++                                        static_cast<jstring>(j_filepath.ref));
+ }
+ 
+ std::string GetParentDirectory(const std::string& filepath) {
+@@ -101,12 +120,13 @@ std::string GetParentDirectory(const std::string& filepath) {
+         return "";
+     }
+     auto env = Common::Android::GetEnvForThread();
+-    jstring j_return = static_cast<jstring>(env->CallStaticObjectMethod(
+-        native_library, s_get_parent_directory, Common::Android::ToJString(env, filepath)));
+-    if (!j_return) {
++    LocalRef j_filepath{env, Common::Android::ToJString(env, filepath)};
++    LocalRef j_return{env, env->CallStaticObjectMethod(native_library, s_get_parent_directory,
++                                                       static_cast<jstring>(j_filepath.ref))};
++    if (!j_return.ref) {
+         return {};
+     }
+-    return Common::Android::GetJString(env, j_return);
++    return Common::Android::GetJString(env, static_cast<jstring>(j_return.ref));
+ }
+ 
+ std::string GetFilename(const std::string& filepath) {
+@@ -114,12 +134,13 @@ std::string GetFilename(const std::string& filepath) {
+         return "";
+     }
+     auto env = Common::Android::GetEnvForThread();
+-    jstring j_return = static_cast<jstring>(env->CallStaticObjectMethod(
+-        native_library, s_get_filename, Common::Android::ToJString(env, filepath)));
+-    if (!j_return) {
++    LocalRef j_filepath{env, Common::Android::ToJString(env, filepath)};
++    LocalRef j_return{env, env->CallStaticObjectMethod(native_library, s_get_filename,
++                                                       static_cast<jstring>(j_filepath.ref))};
++    if (!j_return.ref) {
+         return {};
+     }
+-    return Common::Android::GetJString(env, j_return);
++    return Common::Android::GetJString(env, static_cast<jstring>(j_return.ref));
+ }
+ 
+ } // namespace Common::FS::Android
+diff --git a/src/common/heap_tracker.cpp b/src/common/heap_tracker.cpp
+index b72abb16d..60369802e 100644
+--- a/src/common/heap_tracker.cpp
++++ b/src/common/heap_tracker.cpp
+@@ -32,7 +32,19 @@ s64 GetMaxPermissibleResidentMapCount() {
+ 
+ HeapTracker::HeapTracker(Common::HostMemory& buffer)
+     : m_buffer(buffer), m_max_resident_map_count(GetMaxPermissibleResidentMapCount()) {}
+-HeapTracker::~HeapTracker() = default;
++HeapTracker::~HeapTracker() {
++    // The trees only link the nodes, they do not own them (Map() allocates with new), so free
++    // every remaining node here. Nothing may be mapping through this tracker any more.
++    auto it = m_mappings.begin();
++    while (it != m_mappings.end()) {
++        auto* const item = std::addressof(*it);
++        if (item->is_resident) {
++            m_resident_mappings.erase(m_resident_mappings.iterator_to(*item));
++        }
++        it = m_mappings.erase(it);
++        delete item;
++    }
++}
+ 
+ void HeapTracker::Map(size_t virtual_offset, size_t host_offset, size_t length,
+                       MemoryPermission perm, bool is_separate_heap) {
+diff --git a/src/common/logging.cpp b/src/common/logging.cpp
+index 768dc2359..af3749768 100644
+--- a/src/common/logging.cpp
++++ b/src/common/logging.cpp
+@@ -4,7 +4,9 @@
+ // SPDX-FileCopyrightText: 2014 Citra Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <array>
+ #include <atomic>
++#include <mutex>
+ #include <chrono>
+ #include <climits>
+ #include <cstdio>
+@@ -263,6 +265,9 @@ struct FileBackend final : public Backend {
+     ~FileBackend() noexcept override = default;
+ 
+     void Write(const Entry& entry) noexcept override {
++        // Logging is synchronous and happens on every emulator thread; serialize access to the
++        // byte counter and the enabled flag (the FILE itself is already locked by stdio).
++        std::scoped_lock lock{write_mutex};
+         if (!enabled)
+             return;
+ 
+@@ -304,9 +309,11 @@ struct FileBackend final : public Backend {
+     }
+ 
+     void Flush() noexcept override {
++        std::scoped_lock lock{write_mutex};
+         file->Flush();
+     }
+ private:
++    std::mutex write_mutex;
+     std::optional<FS::IOFile> file;
+     std::size_t bytes_written = 0;
+     bool enabled = true;
+@@ -439,11 +446,57 @@ void SetColorConsoleBackendEnabled(bool enabled) {
+         logging_instance->color_console_backend.enabled = enabled;
+ }
+ 
++namespace {
++
++// Log calls are synchronous (formatting + logcat + file write on the calling thread), so a stubbed
++// service or a warning inside a per-draw/per-frame path that fires thousands of times costs real
++// emulation time and floods the log. Each call site is allowed a short burst, after which only
++// every RepeatInterval-th occurrence is written, tagged with the running count.
++struct RepeatSlot {
++    std::atomic<u64> key{0};
++    std::atomic<u32> count{0};
++};
++constexpr size_t RepeatSlotCount = 1024;
++constexpr u32 RepeatBurst = 32;
++constexpr u32 RepeatInterval = 1024;
++std::array<RepeatSlot, RepeatSlotCount> repeat_slots{};
++
++/// Returns how many times this call site has been hit (1-based, approximate under contention).
++u32 CountCallSite(const char* filename, unsigned int line_num) noexcept {
++    u64 key = static_cast<u64>(reinterpret_cast<uintptr_t>(filename));
++    key ^= static_cast<u64>(line_num) * 0x9E3779B97F4A7C15ULL;
++    key ^= key >> 29;
++    key |= 1; // 0 marks an empty slot
++    RepeatSlot& slot = repeat_slots[(key ^ (key >> 32)) % RepeatSlotCount];
++    if (slot.key.load(std::memory_order_relaxed) != key) {
++        // Slot owned by another call site (or empty): take it over and start counting again.
++        slot.key.store(key, std::memory_order_relaxed);
++        slot.count.store(1, std::memory_order_relaxed);
++        return 1;
++    }
++    return slot.count.fetch_add(1, std::memory_order_relaxed) + 1;
++}
++
++} // Anonymous namespace
++
+ void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename, unsigned int line_num, const char* function, std::string_view format, const std::format_args& args) {
+     if (logging_instance && logging_instance->filter.CheckMessage(log_class, log_level)) {
+         auto const flush = ::Settings::values.log_flush_line.GetValue();
+ 
++        u32 repeat_count = 0;
++        if (log_level < Level::Critical && !::Settings::values.extended_logging.GetValue()) {
++            repeat_count = CountCallSite(filename, line_num);
++            if (repeat_count > RepeatBurst && repeat_count % RepeatInterval != 0) {
++                return;
++            }
++        }
++
+         std::string msg = std::vformat(format, args);
++        if (repeat_count == RepeatBurst) {
++            msg += " [repeating; further messages from this line are rate-limited]";
++        } else if (repeat_count > RepeatBurst) {
++            msg += std::format(" [repeated {} times]", repeat_count);
++        }
+ 
+         Entry e{
+             .message = msg.c_str(),
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 427850c3d..1429425a6 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -624,6 +624,19 @@ struct Values {
+                                                                true,
+                                                                true};
+ 
++    // Caps how often the emulated display composes (and therefore how often the game is allowed
++    // to render). Lower values cut CPU and GPU work, and heat, proportionally. Games with a fixed
++    // per-frame timestep run in slow motion when capped below their native frame rate.
++    SwitchableSetting<FpsLimit, true> fps_limit{linkage,
++                                                FpsLimit::Off,
++                                                FpsLimit::Off,
++                                                FpsLimit::Fps60,
++                                                "fps_limit",
++                                                Category::Renderer,
++                                                Specialization::Default,
++                                                true,
++                                                true};
++
+     SwitchableSetting<AstcRecompression, true> astc_recompression{linkage,
+                                                                   AstcRecompression::Uncompressed,
+                                                                   "astc_recompression",
+@@ -714,7 +727,13 @@ struct Values {
+     SwitchableSetting<bool> emulate_bgr565{linkage, false, "emulate_bgr565",
+                                             Category::RendererHacks};
+ 
+-    SwitchableSetting<bool> use_asynchronous_shaders{linkage, false, "use_asynchronous_shaders",
++    SwitchableSetting<bool> use_asynchronous_shaders{linkage,
++#ifdef __ANDROID__
++                                                     true,
++#else
++                                                     false,
++#endif
++                                                     "use_asynchronous_shaders",
+                                                      Category::RendererHacks};
+ 
+     SwitchableSetting<GpuUnswizzleSize> gpu_unswizzle_texture_size{linkage,
+diff --git a/src/common/settings_enums.h b/src/common/settings_enums.h
+index aba53e918..b84b8574d 100644
+--- a/src/common/settings_enums.h
++++ b/src/common/settings_enums.h
+@@ -132,6 +132,7 @@ ENUM(AnisotropyMode, Automatic, Default, X2, X4, X8, X16);
+ ENUM(AstcDecodeMode, Cpu, Gpu, CpuAsynchronous);
+ ENUM(AstcRecompression, Uncompressed, Bc1, Bc3);
+ ENUM(FramePacingMode, Target_Auto, Target_30, Target_60, Target_90, Target_120);
++ENUM(FpsLimit, Off, Fps20, Fps30, Fps60);
+ ENUM(VSyncMode, Immediate, Mailbox, Fifo, FifoRelaxed);
+ ENUM(VramUsageMode, Conservative, Aggressive);
+ ENUM(RendererBackend, OpenGL_GLSL, Vulkan, Null, OpenGL_GLASM, OpenGL_SPIRV);
+diff --git a/src/common/sparse_large_vector.h b/src/common/sparse_large_vector.h
+index 8496c28ce..88997ce6e 100644
+--- a/src/common/sparse_large_vector.h
++++ b/src/common/sparse_large_vector.h
+@@ -148,6 +148,22 @@ public:
+         }
+     }
+ 
++    /// Gives back the physical memory behind every committed page while keeping the reservation,
++    /// so later accesses still read zeroes instead of faulting.
++    void DecommitAll() noexcept {
++        if (base_ptr == nullptr) {
++            return;
++        }
++        for (std::size_t word = 0; word < committed_pages.size(); ++word) {
++            u64 bits = committed_pages[word].load(std::memory_order_acquire);
++            while (bits != 0) {
++                const std::size_t page_index = word * 64 + static_cast<std::size_t>(std::countr_zero(bits));
++                bits &= bits - 1;
++                DecommitPage(page_index * HostPageSize / sizeof(T));
++            }
++        }
++    }
++
+     constexpr T& GetUnchecked(size_t index) {
+         return base_ptr[index];
+     }
+diff --git a/src/core/file_sys/vfs/vfs_real.cpp b/src/core/file_sys/vfs/vfs_real.cpp
+index 14e0caad3..e930b40f7 100644
+--- a/src/core/file_sys/vfs/vfs_real.cpp
++++ b/src/core/file_sys/vfs/vfs_real.cpp
+@@ -100,6 +100,8 @@ VirtualFile RealVfsFilesystem::OpenFileFromEntry(std::string_view path_, std::op
+         if (auto file = it->second.lock(); file) {
+             return file;
+         }
++        // The file is gone; drop the dead entry instead of keeping the key forever.
++        cache.erase(it);
+     }
+ 
+     if (!size && !FS::IsFile(path)) {
+@@ -234,12 +236,19 @@ std::unique_lock<std::mutex> RealVfsFilesystem::RefreshReference(const std::stri
+     return lk;
+ }
+ 
+-void RealVfsFilesystem::DropReference(std::unique_ptr<FileReference>&& reference) {
++void RealVfsFilesystem::DropReference(std::unique_ptr<FileReference>&& reference,
++                                      std::string_view path) {
+     if (in_dtor)
+         return;
+ 
+     std::scoped_lock lk{list_lock};
+ 
++    // Forget the cache entry of a file nobody references any more. Without this every path that
++    // was ever opened (game list scans, update/DLC probing, save files) stays in the map forever.
++    if (auto it = cache.find(path); it != cache.end() && it->second.expired()) {
++        cache.erase(it);
++    }
++
+     // Remove from list.
+     this->RemoveReferenceFromListLocked(*reference);
+ 
+@@ -293,7 +302,7 @@ RealVfsFile::RealVfsFile(RealVfsFilesystem& base_, std::unique_ptr<FileReference
+       path_components(FS::SplitPathComponentsCopy(path_)), size(size_), perms(perms_) {}
+ 
+ RealVfsFile::~RealVfsFile() {
+-    base.DropReference(std::move(reference));
++    base.DropReference(std::move(reference), path);
+ }
+ 
+ std::string RealVfsFile::GetName() const {
+diff --git a/src/core/file_sys/vfs/vfs_real.h b/src/core/file_sys/vfs/vfs_real.h
+index a97f7d32e..a34946d91 100644
+--- a/src/core/file_sys/vfs/vfs_real.h
++++ b/src/core/file_sys/vfs/vfs_real.h
+@@ -62,7 +62,7 @@ private:
+     friend class RealVfsFile;
+     std::unique_lock<std::mutex> RefreshReference(const std::string& path, OpenMode perms,
+                                                   FileReference& reference);
+-    void DropReference(std::unique_ptr<FileReference>&& reference);
++    void DropReference(std::unique_ptr<FileReference>&& reference, std::string_view path);
+ 
+ private:
+     friend class RealVfsDirectory;
+diff --git a/src/core/hle/kernel/k_page_table_base.cpp b/src/core/hle/kernel/k_page_table_base.cpp
+index ba5203b4a..5768609a1 100644
+--- a/src/core/hle/kernel/k_page_table_base.cpp
++++ b/src/core/hle/kernel/k_page_table_base.cpp
+@@ -499,6 +499,10 @@ void KPageTableBase::Finalize() {
+         m_resource_limit->Release(m_system.Kernel(), Svc::LimitableResource::PhysicalMemoryMax,
+                                   m_mapped_ipc_server_memory);
+     }
++
++    // Guest objects are never destroyed (the slab heap only recycles the slot), so the host
++    // pages that back the page table entries would otherwise stay resident after every launch.
++    m_impl.entries.DecommitAll();
+ }
+ 
+ KProcessAddress KPageTableBase::GetRegionAddress(Svc::MemoryState state) const {
+diff --git a/src/core/hle/kernel/k_process.cpp b/src/core/hle/kernel/k_process.cpp
+index 27d1b1bfc..3e2283bd5 100644
+--- a/src/core/hle/kernel/k_process.cpp
++++ b/src/core/hle/kernel/k_process.cpp
+@@ -180,6 +180,10 @@ void KProcess::Finalize(KernelCore& kernel) {
+         interface.reset();
+     }
+     m_exclusive_monitor.reset();
++    m_debug_page_refcounts.clear();
++    // Every host thread that could touch guest memory is already stopped at this point
++    // (cores, services, GPU and audio are shut down before the kernel).
++    m_memory.ReleaseHostResources();
+ 
+     // Perform inherited finalization.
+     KSynchronizationObject::Finalize(kernel);
+diff --git a/src/core/hle/service/filesystem/filesystem.cpp b/src/core/hle/service/filesystem/filesystem.cpp
+index 9f0410e23..3e17075a2 100644
+--- a/src/core/hle/service/filesystem/filesystem.cpp
++++ b/src/core/hle/service/filesystem/filesystem.cpp
+@@ -797,6 +797,11 @@ void FileSystemController::InitTempStorage() {
+ void FileSystemController::Reset() {
+     std::scoped_lock lk{registration_lock};
+     registrations.clear();
++    // Drop the previous launch's game card (XCI/NSP files, fds and mappings). Nothing outside this
++    // class keeps these pointers; they are re-created by SetGameCard on the next launch.
++    gamecard_registered.reset();
++    gamecard_placeholder.reset();
++    gamecard.reset();
+ }
+ 
+ void LoopProcess(Core::System& system) {
+diff --git a/src/core/hle/service/nifm/nifm.cpp b/src/core/hle/service/nifm/nifm.cpp
+index efada9b80..86c3f3277 100644
+--- a/src/core/hle/service/nifm/nifm.cpp
++++ b/src/core/hle/service/nifm/nifm.cpp
+@@ -250,10 +250,11 @@ public:
+ 
+     ~IScanRequest() override {
+         state.store(State::Idle);
+-        svc_ctx.CloseEvent(evt_scan_complete);
+-        svc_ctx.CloseEvent(evt_processing);
++        // The worker signals these events when it finishes, so it must stop first.
+         if (worker.joinable())
+             worker.join();
++        svc_ctx.CloseEvent(evt_scan_complete);
++        svc_ctx.CloseEvent(evt_processing);
+     }
+ 
+ private:
+@@ -277,6 +278,9 @@ private:
+         state.store(State::Processing);
+         evt_processing->Signal(system.Kernel());
+ 
++        // Assigning over a joinable std::thread would call std::terminate.
++        if (worker.joinable())
++            worker.join();
+         worker = std::thread(&IScanRequest::WorkerThread, this);
+         IPC::ResponseBuilder{ctx, 2}.Push(ResultSuccess);
+     }
+diff --git a/src/core/hle/service/vi/conductor.cpp b/src/core/hle/service/vi/conductor.cpp
+index fd7233cf9..d1f58051c 100644
+--- a/src/core/hle/service/vi/conductor.cpp
++++ b/src/core/hle/service/vi/conductor.cpp
+@@ -99,6 +99,25 @@ void Conductor::VsyncThread(std::stop_token token) {
+     }
+ }
+ 
++namespace {
++
++/// Shortest composition period allowed by the user's FPS limit, or 0 when there is no limit.
++s64 FpsLimitPeriodNs() {
++    switch (Settings::values.fps_limit.GetValue()) {
++    case Settings::FpsLimit::Fps20:
++        return 1'000'000'000 / 20;
++    case Settings::FpsLimit::Fps30:
++        return 1'000'000'000 / 30;
++    case Settings::FpsLimit::Fps60:
++        return 1'000'000'000 / 60;
++    case Settings::FpsLimit::Off:
++    default:
++        return 0;
++    }
++}
++
++} // Anonymous namespace
++
+ s64 Conductor::GetNextTicks() const {
+     const auto& settings = Settings::values;
+     auto speed_scale = 1.f;
+@@ -122,7 +141,10 @@ s64 Conductor::GetNextTicks() const {
+     }
+ 
+     const f32 effective_fps = 60.f / static_cast<f32>(m_swap_interval);
+-    return static_cast<s64>(speed_scale * (1000000000.f / effective_fps));
++    const s64 period = static_cast<s64>(speed_scale * (1000000000.f / effective_fps));
++    // The game only gets a new frame slot when the display composes, so stretching this period
++    // is what actually removes rendering work (unlike limiting presentation on the host side).
++    return (std::max)(period, FpsLimitPeriodNs());
+ }
+ 
+ s64 Conductor::GetFramePeriodNs() const {
+@@ -143,6 +165,7 @@ s64 Conductor::GetFramePeriodNs() const {
+     if (unlocked) {
+         period /= UNLOCKED_TARGET_DIVISOR;
+     }
++    period = (std::max)(period, FpsLimitPeriodNs());
+     return std::clamp<s64>(period, 1'000'000, 100'000'000);
+ }
+ 
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index 74ca24419..f77115d37 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -792,6 +792,10 @@ void Memory::Reset() {
+     impl = std::make_unique<Impl>(system);
+ }
+ 
++void Memory::ReleaseHostResources() {
++    impl.reset();
++}
++
+ void Memory::SetCurrentPageTable(Kernel::KProcess& process) {
+     impl->SetCurrentPageTable(process);
+ }
+diff --git a/src/core/memory.h b/src/core/memory.h
+index f206b7a72..a1830e5b0 100644
+--- a/src/core/memory.h
++++ b/src/core/memory.h
+@@ -80,6 +80,11 @@ public:
+      */
+     void Reset();
+ 
++    /// Frees the host side state (scratch buffers, heap tracker). Guest kernel objects are
++    /// recycled without running their destructors, so the owner has to call this explicitly.
++    /// The object must not be used for memory access afterwards.
++    void ReleaseHostResources();
++
+     /**
+      * Changes the currently active page table to that of the given process instance.
+      *
+diff --git a/src/input_common/drivers/android.cpp b/src/input_common/drivers/android.cpp
+index 6225ccbe3..f8f581693 100644
+--- a/src/input_common/drivers/android.cpp
++++ b/src/input_common/drivers/android.cpp
+@@ -4,8 +4,10 @@
+ // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
++#include <algorithm>
+ #include <format>
+ #include <set>
++#include <vector>
+ #include <common/settings_input.h>
+ #include <common/thread.h>
+ #include <jni.h>
+@@ -26,13 +28,30 @@ Android::Android(std::string input_engine_) : InputEngine(std::move(input_engine
+     });
+ }
+ 
+-Android::~Android() = default;
++Android::~Android() {
++    // Stop the vibration worker before releasing the device references it uses.
++    vibration_thread.request_stop();
++    if (vibration_thread.joinable()) {
++        vibration_thread.join();
++    }
++    if (input_devices.empty()) {
++        return;
++    }
++    auto env = Common::Android::GetEnvForThread();
++    for (auto& [identifier, device] : input_devices) {
++        if (device != nullptr) {
++            env->DeleteGlobalRef(device);
++        }
++    }
++    input_devices.clear();
++}
+ 
+ void Android::RegisterController(jobject j_input_device) {
+     auto env = Common::Android::GetEnvForThread();
+-    const std::string guid = Common::Android::GetJString(
+-        env, static_cast<jstring>(
+-                 env->CallObjectMethod(j_input_device, Common::Android::GetYuzuDeviceGetGUID())));
++    auto j_guid = static_cast<jstring>(
++        env->CallObjectMethod(j_input_device, Common::Android::GetYuzuDeviceGetGUID()));
++    const std::string guid = Common::Android::GetJString(env, j_guid);
++    env->DeleteLocalRef(j_guid);
+     const s32 port = env->CallIntMethod(j_input_device, Common::Android::GetYuzuDeviceGetPort());
+     const auto identifier = GetIdentifier(guid, static_cast<size_t>(port));
+     PreSetController(identifier);
+@@ -99,6 +118,7 @@ std::vector<Common::ParamPackage> Android::GetInputDevices() const {
+             env->CallObjectMethod(value, Common::Android::GetYuzuDeviceGetName()));
+         const std::string name =
+             std::format("{} {}", Common::Android::GetJString(env, name_object), key.port);
++        env->DeleteLocalRef(name_object);
+         devices.emplace_back(Common::ParamPackage{
+             {"engine", GetEngineName()},
+             {"display", std::move(name)},
+@@ -113,10 +133,16 @@ std::set<s32> Android::GetDeviceAxes(JNIEnv* env, jobject& j_device) const {
+     auto j_axes = static_cast<jobjectArray>(
+         env->CallObjectMethod(j_device, Common::Android::GetYuzuDeviceGetAxes()));
+     std::set<s32> axes;
+-    for (int i = 0; i < env->GetArrayLength(j_axes); ++i) {
++    if (j_axes == nullptr) {
++        return axes;
++    }
++    const jsize count = env->GetArrayLength(j_axes);
++    for (jsize i = 0; i < count; ++i) {
+         jobject axis = env->GetObjectArrayElement(j_axes, i);
+         axes.insert(env->CallIntMethod(axis, Common::Android::GetIntegerValueMethod()));
++        env->DeleteLocalRef(axis);
+     }
++    env->DeleteLocalRef(j_axes);
+     return axes;
+ }
+ 
+@@ -220,13 +246,20 @@ ButtonMapping Android::GetButtonMappingForDevice(const Common::ParamPackage& par
+     env->SetIntArrayRegion(j_keys, 0, static_cast<int>(keycode_ids.size()), keycode_ids.data());
+     auto j_has_keys_object = static_cast<jbooleanArray>(
+         env->CallObjectMethod(j_device, Common::Android::GetYuzuDeviceHasKeys(), j_keys));
+-    jboolean isCopy = false;
+-    jboolean* j_has_keys = env->GetBooleanArrayElements(j_has_keys_object, &isCopy);
++    env->DeleteLocalRef(j_keys);
+ 
+     std::set<s32> available_keys;
+-    for (size_t i = 0; i < keycode_ids.size(); ++i) {
+-        if (j_has_keys[i]) {
+-            available_keys.insert(keycode_ids[i]);
++    if (j_has_keys_object != nullptr) {
++        // Copy the result out instead of pinning it; the pinned buffer was never released.
++        const jsize key_count = (std::min)(env->GetArrayLength(j_has_keys_object),
++                                           static_cast<jsize>(keycode_ids.size()));
++        std::vector<jboolean> j_has_keys(static_cast<size_t>(key_count));
++        env->GetBooleanArrayRegion(j_has_keys_object, 0, key_count, j_has_keys.data());
++        env->DeleteLocalRef(j_has_keys_object);
++        for (jsize i = 0; i < key_count; ++i) {
++            if (j_has_keys[static_cast<size_t>(i)]) {
++                available_keys.insert(keycode_ids[static_cast<size_t>(i)]);
++            }
+         }
+     }
+ 
+diff --git a/src/qt_common/config/shared_translation.cpp b/src/qt_common/config/shared_translation.cpp
+index 737ea2a90..0da8d4f27 100644
+--- a/src/qt_common/config/shared_translation.cpp
++++ b/src/qt_common/config/shared_translation.cpp
+@@ -220,6 +220,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
+               "intermediate format: RGBA8.\n"
+               "BC1/BC3: The intermediate format will be recompressed to BC1 or BC3 format,\n"
+               " saving VRAM but degrading image quality."));
++    INSERT(Settings, fps_limit, tr("FPS Limit:"),
++           tr("Caps how often the game may render a frame. Lower limits reduce CPU/GPU load and "
++              "heat. Games tied to a fixed frame rate run in slow motion below their native FPS."));
+     INSERT(Settings, frame_pacing_mode, tr("Frame Pacing Mode (Vulkan only)"),
+            tr("Controls how the emulator manages frame pacing to reduce stuttering and make the "
+               "frame rate smoother and more consistent."));
+@@ -435,6 +438,13 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
+                               PAIR(FramePacingMode, Target_90, tr("90 FPS")),
+                               PAIR(FramePacingMode, Target_120, tr("120 FPS")),
+                           }});
++    translations->insert({Settings::EnumMetadata<Settings::FpsLimit>::Index(),
++                          {
++                              PAIR(FpsLimit, Off, tr("Off")),
++                              PAIR(FpsLimit, Fps20, tr("20 FPS")),
++                              PAIR(FpsLimit, Fps30, tr("30 FPS")),
++                              PAIR(FpsLimit, Fps60, tr("60 FPS")),
++                          }});
+     translations->insert({Settings::EnumMetadata<Settings::VramUsageMode>::Index(),
+                           {
+                               PAIR(VramUsageMode, Conservative, tr("Conservative")),
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index d4bc8d0ec..eff97e384 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -6,7 +6,10 @@
+ 
+ #pragma once
+ 
++#include <cerrno>
++#include <chrono>
+ #include <condition_variable>
++#include <ctime>
+ #include <cstddef>
+ #include <functional>
+ #include <memory>
+@@ -149,14 +152,7 @@ public:
+             frame_counter++;
+             auto target_time = start_time + frame_interval * frame_counter;
+             if (target_time >= now) {
+-                constexpr auto spin_tail = std::chrono::milliseconds(1);
+-                auto sleep_time = target_time - now;
+-                if (sleep_time > spin_tail * 2) {
+-                    std::this_thread::sleep_for(sleep_time - spin_tail);
+-                }
+-                while (std::chrono::steady_clock::now() < target_time) {
+-                    std::this_thread::yield();
+-                }
++                SleepUntilPrecise(target_time);
+             } else if (frame_counter > max_frame_count) {
+                 frame_counter = 0;
+                 start_time = now;
+@@ -164,6 +160,31 @@ public:
+         }
+     }
+ 
++    /// Sleeps until the given time point. On Linux/Android an absolute CLOCK_MONOTONIC sleep is
++    /// already accurate to well under 100 us, so the old 1-2 ms yield() spin at the end of every
++    /// paced frame (which kept a big core awake at 100% for nothing) is not needed there.
++    static void SleepUntilPrecise(std::chrono::steady_clock::time_point target_time) {
++#if defined(__linux__) || defined(__ANDROID__)
++        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                            target_time.time_since_epoch())
++                            .count();
++        timespec deadline{};
++        deadline.tv_sec = static_cast<time_t>(ns / 1'000'000'000);
++        deadline.tv_nsec = static_cast<long>(ns % 1'000'000'000);
++        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, nullptr) == EINTR) {
++        }
++#else
++        constexpr auto spin_tail = std::chrono::milliseconds(1);
++        const auto now = std::chrono::steady_clock::now();
++        if (target_time - now > spin_tail * 2) {
++            std::this_thread::sleep_for(target_time - now - spin_tail);
++        }
++        while (std::chrono::steady_clock::now() < target_time) {
++            std::this_thread::yield();
++        }
++#endif
++    }
++
+     /// Returns the master timeline semaphore.
+     [[nodiscard]] MasterSemaphore& GetMasterSemaphore() const noexcept {
+         return *master_semaphore;
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index ab82c3fc2..d35bd17e2 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -1101,7 +1101,8 @@ VkImageView TextureCacheRuntime::GetOrCreateTirColorScratch(VkImage color_image,
+         return *scratch.view;
+     }
+     if (scratch.image) {
+-        scheduler.Finish();
++        // Defer destruction until the GPU is done with it instead of stalling the CPU.
++        pending_tir_color_scratch.emplace_back(scheduler.CurrentTick(), std::move(scratch));
+     }
+     scratch.image = memory_allocator.CreateImage(VkImageCreateInfo{
+         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+@@ -1177,6 +1178,17 @@ void TextureCacheRuntime::EraseResolveShadow(VkImage msaa_image) {
+     resolve_shadows.erase(it);
+ }
+ 
++void TextureCacheRuntime::EraseTirColorScratch(VkImage color_image) {
++    const auto it = tir_color_scratch.find(color_image);
++    if (it == tir_color_scratch.end()) {
++        return;
++    }
++    if (it->second.image) {
++        pending_tir_color_scratch.emplace_back(scheduler.CurrentTick(), std::move(it->second));
++    }
++    tir_color_scratch.erase(it);
++}
++
+ void TextureCacheRuntime::BarrierFeedbackLoop() {
+     scheduler.RequestOutsideRenderPassOperationContext();
+ }
+@@ -1924,6 +1936,9 @@ void TextureCacheRuntime::TickFrame() {
+     std::erase_if(pending_resolve_shadows, [this](const auto& pending) {
+         return scheduler.IsFree(pending.first);
+     });
++    std::erase_if(pending_tir_color_scratch, [this](const auto& pending) {
++        return scheduler.IsFree(pending.first);
++    });
+ }
+ 
+ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu_addr_,
+@@ -1971,6 +1986,16 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
+ Image::Image(const VideoCommon::NullImageParams& params) : VideoCommon::ImageBase{params} {}
+ 
+ Image::~Image() {
++    if (runtime != nullptr) {
++        // Scratch targets are keyed by VkImage handle; drop them with the image so they neither
++        // pile up nor get matched against a recycled handle.
++        if (original_image) {
++            runtime->EraseTirColorScratch(*original_image);
++        }
++        if (scaled_image) {
++            runtime->EraseTirColorScratch(*scaled_image);
++        }
++    }
+     if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
+         if (original_image) {
+             runtime->EraseResolveShadow(*original_image);
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index 2641f1fe6..59b16f401 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -143,6 +143,7 @@ public:
+     void MarkResolveShadowUpToDate(VkImage msaa_image);
+ 
+     void EraseResolveShadow(VkImage msaa_image);
++    void EraseTirColorScratch(VkImage color_image);
+ 
+     std::span<const VkFormat> ViewFormats(PixelFormat format) {
+         return view_formats[static_cast<std::size_t>(format)];
+@@ -202,6 +203,7 @@ public:
+         VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+     };
+     ::Common::unordered_map<VkImage, TirColorScratch> tir_color_scratch;
++    std::vector<std::pair<u64, TirColorScratch>> pending_tir_color_scratch;
+     std::vector<std::pair<u64, ResolveShadow>> pending_resolve_shadows;
+ };
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_turbo_mode.cpp b/src/video_core/renderer_vulkan/vk_turbo_mode.cpp
+index 095908b6c..d7fd754e5 100644
+--- a/src/video_core/renderer_vulkan/vk_turbo_mode.cpp
++++ b/src/video_core/renderer_vulkan/vk_turbo_mode.cpp
+@@ -8,6 +8,7 @@
+ #include <adrenotools/driver.h>
+ #endif
+ 
++#include "common/adpf.h"
+ #include "common/literals.h"
+ #include "video_core/host_shaders/vulkan_turbo_mode_comp_spv.h"
+ #include "video_core/renderer_vulkan/renderer_vulkan.h"
+@@ -36,7 +37,11 @@ TurboMode::~TurboMode() = default;
+ void TurboMode::QueueSubmitted() {
+     std::scoped_lock lk{m_submission_lock};
+     m_submission_time = std::chrono::steady_clock::now();
+-    m_submission_cv.notify_one();
++    // Only wake the worker when it is actually waiting for work; the scheduler submits many times
++    // per frame and an unconditional notify costs a context switch each time.
++    if (m_waiting_for_submission) {
++        m_submission_cv.notify_one();
++    }
+ }
+ 
+ void TurboMode::Run(std::stop_token stop_token) {
+@@ -153,12 +158,64 @@ void TurboMode::Run(std::stop_token stop_token) {
+     auto cmdbuf = vk::CommandBuffer{cmdbufs[0], m_device.GetDispatchLoader()};
+ #endif
+ 
+-    while (!stop_token.stop_requested()) {
+ #ifdef __ANDROID__
++    // On Android turbo is a KGSL power-level request, not a busy GPU workload: it only has to be
++    // set once while the game is submitting work, and dropped again once submissions stop (pause,
++    // menus, loading screens), otherwise the GPU stays pinned at its top clock while idle.
++    constexpr auto IdleTimeout = std::chrono::milliseconds{250};
++    bool turbo_enabled = false;
++    while (!stop_token.stop_requested()) {
++        std::unique_lock lk{m_submission_lock};
++        // Sleep until the renderer submits something.
++        m_waiting_for_submission = true;
++        m_submission_cv.wait(lk, stop_token, [this, IdleTimeout] {
++            return (std::chrono::steady_clock::now() - m_submission_time) <= IdleTimeout;
++        });
++        m_waiting_for_submission = false;
++        if (stop_token.stop_requested()) {
++            break;
++        }
++        if (!turbo_enabled && !Common::ADPF::IsThermallyConstrained()) {
++            lk.unlock();
++#ifdef ARCHITECTURE_arm64
++            adrenotools_set_turbo(true);
++#endif
++            turbo_enabled = true;
++            lk.lock();
++        }
++        // Stay asleep while work keeps coming; wake up once submissions have been quiet for
++        // IdleTimeout and release the clock request.
++        while (!stop_token.stop_requested()) {
++            const auto deadline = m_submission_time + IdleTimeout;
++            if (std::chrono::steady_clock::now() >= deadline) {
++                break;
++            }
++            m_submission_cv.wait_until(lk, stop_token, deadline, [] { return false; });
++            // Forcing the top GPU level while the device is about to throttle only makes the
++            // throttling harder; let the governor pick clocks until it has cooled down.
++            const bool constrained = Common::ADPF::IsThermallyConstrained();
++            if (turbo_enabled == constrained) {
++                lk.unlock();
+ #ifdef ARCHITECTURE_arm64
+-        adrenotools_set_turbo(true);
++                adrenotools_set_turbo(!constrained);
+ #endif
++                turbo_enabled = !constrained;
++                lk.lock();
++            }
++        }
++        if (stop_token.stop_requested()) {
++            break;
++        }
++        lk.unlock();
++        if (turbo_enabled) {
++#ifdef ARCHITECTURE_arm64
++            adrenotools_set_turbo(false);
++#endif
++            turbo_enabled = false;
++        }
++    }
+ #else
++    while (!stop_token.stop_requested()) {
+         // Reset the fence.
+         fence.Reset();
+ 
+@@ -224,14 +281,17 @@ void TurboMode::Run(std::stop_token stop_token) {
+ 
+         // Wait for completion.
+         fence.Wait();
+-#endif
++
+         // Wait for the next graphics queue submission if necessary.
+         std::unique_lock lk{m_submission_lock};
++        m_waiting_for_submission = true;
+         m_submission_cv.wait(lk, stop_token, [this] {
+             return (std::chrono::steady_clock::now() - m_submission_time) <=
+                    std::chrono::milliseconds{100};
+         });
++        m_waiting_for_submission = false;
+     }
++#endif
+ #if defined(__ANDROID__) && defined(ARCHITECTURE_arm64)
+     adrenotools_set_turbo(false);
+ #endif
+diff --git a/src/video_core/renderer_vulkan/vk_turbo_mode.h b/src/video_core/renderer_vulkan/vk_turbo_mode.h
+index 6f95cf5e7..14be3391b 100644
+--- a/src/video_core/renderer_vulkan/vk_turbo_mode.h
++++ b/src/video_core/renderer_vulkan/vk_turbo_mode.h
+@@ -33,6 +33,7 @@ private:
+     std::mutex m_submission_lock;
+     std::condition_variable_any m_submission_cv;
+     std::chrono::time_point<std::chrono::steady_clock> m_submission_time{};
++    bool m_waiting_for_submission{}; // guarded by m_submission_lock
+ 
+     std::jthread m_thread;
+ };
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index 489723242..498d9081b 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -1647,7 +1647,17 @@ void Device::CollectPhysicalMemoryInfo() {
+     if (is_integrated) {
+         const s64 available_memory = static_cast<s64>(device_access_memory - device_initial_usage);
+         const u64 memory_size = Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive ? 6_GiB : 4_GiB;
++#ifdef __ANDROID__
++        // The GPU heap of a phone is the same RAM the emulated console and Android itself need.
++        // Subtracting a fixed 8 GiB is always negative there, which made this a constant 4 GiB
++        // regardless of what is actually free and pushed memory-hungry games into swap/low-memory
++        // kills. Use half of what is currently available instead, within [1 GiB, memory_size].
++        static_cast<void>(local_memory);
++        device_access_memory = static_cast<u64>(
++            std::clamp<s64>(available_memory / 2, static_cast<s64>(1_GiB), static_cast<s64>(memory_size)));
++#else
+         device_access_memory = static_cast<u64>(std::max<s64>(std::min<s64>(available_memory - 8_GiB, memory_size), std::min<s64>(local_memory, memory_size)));
++#endif
+     } else {
+         const u64 reserve_memory = std::min<u64>(device_access_memory / 8, 1_GiB);
+         device_access_memory -= reserve_memory;
