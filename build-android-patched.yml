@@ -1,0 +1,112 @@
+name: Build Eden Android (patched)
+
+# Run manually from the Actions tab ("Run workflow").
+on:
+  workflow_dispatch:
+    inputs:
+      patch:
+        description: "Patch file inside the patches/ folder"
+        default: "eden-leak-perf-thermal-fpslimit-v8.patch"
+        required: true
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Apply patch
+        run: |
+          PATCH="patches/${{ github.event.inputs.patch }}"
+          if [ ! -f "$PATCH" ]; then
+            echo "::error title=Patch not found::$PATCH tidak ada. Isi folder patches/: $(ls patches 2>/dev/null | tr '\n' ' ')"
+            exit 1
+          fi
+          # Normalise line endings in case the upload converted them.
+          sed -i 's/\r$//' "$PATCH"
+          if git apply --check "$PATCH" 2>apply.log; then
+            git apply "$PATCH"
+          else
+            echo "Patch does not apply on this commit, retrying on the base commit 6647b49cc"
+            cp "$PATCH" /tmp/eden.patch
+            git fetch --quiet https://github.com/eden-emulator/mirror 6647b49ccc92e343a370138845b0c067d9d01cae || true
+            git checkout --quiet 6647b49ccc92e343a370138845b0c067d9d01cae -- . 2>/dev/null || true
+            if ! git apply --3way /tmp/eden.patch 2>>apply.log; then
+              while IFS= read -r line; do echo "::error title=Apply patch::$line"; done < <(head -n 10 apply.log)
+              exit 1
+            fi
+          fi
+          git --no-pager diff --stat | tail -n 5
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Android SDK packages
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "cmake;3.31.6" "platforms;android-36" "build-tools;36.0.0"
+          # Eden pins a pre-release NDK; it is only listed on the beta/canary channels.
+          NDK=$(grep -oP 'ndkVersion\s*=\s*"\K[^"]+' src/android/app/build.gradle.kts)
+          echo "NDK requested by Eden: $NDK"
+          if ! "$SDKMANAGER" --channel=3 "ndk;$NDK"; then
+            echo "::error title=NDK::NDK $NDK tidak bisa diunduh dari sdkmanager"
+            exit 1
+          fi
+          ls "$ANDROID_HOME/ndk"
+
+      - name: Cache Gradle and CPM downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            .cache/cpm
+          key: eden-android-${{ hashFiles('src/android/**/*.gradle.kts', 'cpmfile.json', '**/cpmfile.json') }}
+          restore-keys: eden-android-
+
+      - name: Build APK
+        run: |
+          chmod +x .ci/android/build.sh
+          set -o pipefail
+          # -DYUZU_DOWNLOAD_ANDROID_VVL=OFF leaves out the 24 MB Vulkan validation layer.
+          if ! .ci/android/build.sh -t standard -b Release -DYUZU_DOWNLOAD_ANDROID_VVL=OFF 2>&1 | tee build.log; then
+            # Surface the real compiler/Gradle errors in the Annotations panel and run summary.
+            grep -nE "error:|error: |^e: |FAILED|What went wrong|Could not|undefined reference|fatal error" build.log \
+              | grep -v "warning:" | head -n 15 > errors.txt || true
+            [ -s errors.txt ] || tail -n 15 build.log > errors.txt
+            while IFS= read -r line; do echo "::error title=Build::${line:0:900}"; done < errors.txt
+            { echo '### Build errors'; echo '```'; cat errors.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: |
+            build.log
+            apply.log
+          if-no-files-found: ignore
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: eden-android-patched
+          path: |
+            artifacts/*.apk
+          if-no-files-found: error
